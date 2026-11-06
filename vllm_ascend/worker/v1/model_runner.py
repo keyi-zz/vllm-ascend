@@ -38,6 +38,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation import breakable_cudagraph
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -187,6 +188,7 @@ from vllm_ascend.ops.triton.decoder_replay import gather_replay_batch
 from vllm_ascend.ops.triton.v1.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.worker.v1.full_extend import FullExtendPlanner
 from vllm_ascend.utils import (
     calc_split_factor,
     check_gdn_layer,
@@ -1146,6 +1148,177 @@ class NPUModelRunner(GPUModelRunner):
         query_start_loc.copy_to_gpu()
 
         return num_reqs_padded
+
+    def _pad_query_start_loc_for_full_extend(
+        self,
+        query_start_loc: torch.Tensor,
+        num_tokens_padded: int,
+        num_reqs: int,
+        req_slots: int,
+    ) -> int:
+        """Fill ``query_start_loc`` for a full-extend replay.
+
+        Real request entries are already populated by ``_prepare_inputs``.
+        Here the token padding is folded into the last real request (its
+        garbage tail rows are trimmed downstream, same as decode FULL) and
+        every sentinel slot ``[num_reqs, req_slots)`` is pinned at
+        ``num_tokens_padded``: zero query length, last entry satisfies the
+        FIA TND constraint. Sentinel KV lengths (1) and zero block-table
+        rows are filled by ``AscendAttentionMetadataBuilder.build`` padding.
+        """
+        assert num_reqs <= req_slots
+        query_start_loc.np[num_reqs] = num_tokens_padded
+        query_start_loc.np[num_reqs + 1 : req_slots + 1] = num_tokens_padded
+        query_start_loc.copy_to_gpu()
+        return req_slots
+
+    def _dummy_run_full_extend(
+        self,
+        fe_desc: BatchDescriptor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dummy forward for capturing one full-extend (non-uniform) graph.
+
+        Mirrors the ChunkedPrefill tail of :meth:`_dummy_run` with the
+        full-extend batch layout: ``req_slots`` request slots whose synthetic
+        scheduled tokens exactly cover ``fe_desc.num_tokens``; unused slots
+        are zero-query sentinels with KV length 1 pinned at block 0 (design
+        D4). Attention metadata is built for capture so the FIA host params
+        register as UpdatableGraph tasks; every replay rebinds them.
+
+        Planner gates already exclude LoRA / spec-decode / drafter / GDN /
+        DCP / multimodal / PP>1, so those branches of _dummy_run are absent
+        here on purpose.
+        """
+        planner = self._full_extend_planner
+        assert planner is not None and fe_desc.num_reqs == planner.req_slots
+        num_tokens = fe_desc.num_tokens
+        req_slots = fe_desc.num_reqs
+
+        scheduled = planner.build_capture_scheduled_tokens(num_tokens)
+        num_scheduled_tokens = np.array(scheduled, dtype=np.int32)
+        assert int(num_scheduled_tokens.sum()) == num_tokens
+        num_active = int(np.count_nonzero(num_scheduled_tokens))
+        self.query_lens = torch.from_numpy(num_scheduled_tokens)
+
+        if self.dynamic_eplb:
+            self.eplb_updator.forward_before()
+
+        # A capture batch never replays: clear the flag rather than let the
+        # metadata report the last real step's replay.
+        self._replay_active = False
+        with self.synchronize_input_prep():
+            self.attn_state = AscendAttentionState.ChunkedPrefill
+            # Active slots carry the worst-case KV length the graph must
+            # tolerate; sentinel slots carry KV length 1 at block 0.
+            self.optimistic_seq_lens_cpu.np[:num_active] = planner.context_cap
+            self.optimistic_seq_lens_cpu.np[num_active:req_slots] = 1
+            self.optimistic_seq_lens_cpu.np[req_slots:].fill(0)
+            self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
+
+            # Zero-length sentinels keep the cumsum flat at num_tokens, so no
+            # extra tokens are introduced on the request axis.
+            cum_num_tokens = self._get_cumsum_and_arange(
+                num_scheduled_tokens, self.query_pos.np
+            )
+            self.query_start_loc.np[0] = 0
+            self.query_start_loc.np[1 : req_slots + 1] = cum_num_tokens
+            self.query_start_loc.copy_to_gpu()
+
+            # Sentinel / active block-table rows all point at block 0 (valid
+            # allocated block, dummy contents); slot_mapping rows are masked
+            # so dummy capture never writes KV caches.
+            for gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                table = self.input_batch.block_table[gid]
+                table.block_table.np[:req_slots].fill(0)
+            self.input_batch.block_table.commit_block_table(req_slots)
+            for gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                blk_table = self.input_batch.block_table[gid]
+                blk_table.slot_mapping.gpu[:num_tokens].fill_(-1)
+
+            attn_metadata, _ = self._build_attention_metadata(
+                num_tokens=num_tokens,
+                num_reqs=req_slots,
+                max_query_len=planner.context_cap,
+                num_tokens_padded=num_tokens,
+                num_reqs_padded=req_slots,
+                for_cudagraph_capture=True,
+                offload_dummy=True,
+                num_scheduled_tokens_np=num_scheduled_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                batch_descriptor=fe_desc,
+            )
+
+        # Make sure padding doesn't exceed max_num_tokens
+        assert num_tokens <= self.max_num_tokens
+        if (
+            self.supports_mm_inputs
+            and not self.model_config.is_encoder_decoder
+            and not self.model_config.requires_raw_input_tokens
+        ) or self.enable_prompt_embeds:
+            input_ids = None
+            inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
+        else:
+            input_ids = self.input_ids.gpu[:num_tokens]
+            inputs_embeds = None
+        positions = self.positions[:num_tokens]
+        update_cos_sin(positions)
+
+        # Logits stay outside the ACL graph (same contract as the existing
+        # FULL decode path); this only warms the lm head when TP-split.
+        need_dummy_logits = lmhead_tp_enable()
+        dummy_indices = torch.zeros(req_slots, dtype=torch.int32, device=self.device)
+
+        def dummy_compute_logits(hidden_states):
+            if not need_dummy_logits:
+                return None
+            return self.model.compute_logits(hidden_states[dummy_indices])
+
+        active_device_metadata_executor = self._prepare_device_metadata_for_forward(
+            CUDAGraphMode.FULL
+        )
+        self.kvpp.prepare_forward(False)
+        with set_ascend_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            num_tokens_across_dp=None,
+            in_profile_run=False,
+            num_actual_tokens=num_tokens,
+            aclgraph_runtime_mode=CUDAGraphMode.FULL,
+            batch_descriptor=fe_desc,
+            model_instance=self.model,
+            device_metadata_executor=active_device_metadata_executor,
+            has_sinks=self._has_sinks,
+            eplb_heat_collection_status=self.eplb_heat_collection_status
+            if self.dynamic_eplb
+            else False,
+        ):
+            outputs = self._model_forward(
+                num_tokens,
+                input_ids,
+                positions,
+                None,
+                inputs_embeds,
+                decoder_replay_dummy=True,
+            )
+        if (
+            active_device_metadata_executor is not None
+            and active_device_metadata_executor.submission_in_flight
+        ):
+            active_device_metadata_executor.release()
+        self.kvpp.complete_forward()
+        if self.use_aux_hidden_state_outputs:
+            hidden_states, _ = outputs
+        else:
+            hidden_states = outputs
+        dummy_compute_logits(hidden_states)
+
+        if self.dynamic_eplb:
+            self.eplb_updator.forward_end(
+                self.eplb_heat_collection_status
+            )
+        self._finalize_dump_data(dump=False)
+        return hidden_states, hidden_states
 
     def _track_tmp_encoder_cache_refs(
         self,
@@ -2506,6 +2679,7 @@ class NPUModelRunner(GPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                    allow_full_extend=True,
                 )
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -2594,6 +2768,21 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
                 if (
+                    self._fe_replay_desc is not None
+                    and cudagraph_mode == CUDAGraphMode.FULL
+                    and batch_desc is self._fe_replay_desc
+                ):
+                    # Full-extend replay: fold token padding into the last real
+                    # request and fill the sentinel slots (zero query length,
+                    # last entry pinned at num_tokens_padded for the FIA TND
+                    # constraint).
+                    num_reqs_padded = self._pad_query_start_loc_for_full_extend(
+                        self.query_start_loc,
+                        num_tokens_padded,
+                        num_reqs,
+                        self._full_extend_planner.req_slots,
+                    )
+                elif (
                     cudagraph_mode == CUDAGraphMode.FULL
                     or (enable_sp() and not self.model_config.use_mla)
                     and self.dcp_size == 1
@@ -3651,6 +3840,7 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        allow_full_extend: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
@@ -3693,6 +3883,41 @@ class NPUModelRunner(GPUModelRunner):
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
                 num_active_loras=num_active_loras,
             )
+
+        # Full-extend: non-uniform batches with a small enough request count,
+        # query length and KV length replay through a whole-forward FULL
+        # graph keyed on the prefill bucket ladder (fixed request slots).
+        # Runs ahead of the regular dispatcher so PIECEWISE/eager stay the
+        # fallback whenever a gate rejects the batch. Only enabled on the
+        # execute_model path (dummy runs pass allow_full_extend=False).
+        if (
+            allow_full_extend
+            and self._full_extend_planner is not None
+            and not uniform_decode
+            and not force_eager
+            and not has_encoder_output
+            and not has_lora
+            and not use_cascade_attn
+        ):
+            self._fe_replay_desc = None
+            max_kv_len = int(self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max())
+            fe_descriptor = self._full_extend_planner.try_dispatch(
+                num_tokens=num_tokens_padded,
+                num_reqs=num_reqs,
+                max_query_len=max_num_scheduled_tokens,
+                max_kv_len=max_kv_len,
+            )
+            if fe_descriptor is not None:
+                self._fe_replay_desc = fe_descriptor
+                fe_stats = None
+                if self.vllm_config.observability_config.cudagraph_metrics:
+                    fe_stats = CUDAGraphStat(
+                        num_unpadded_tokens=num_tokens,
+                        num_padded_tokens=fe_descriptor.num_tokens,
+                        num_paddings=fe_descriptor.num_tokens - num_tokens,
+                        runtime_mode=f"{CUDAGraphMode.FULL.name}(full-extend)",
+                    )
+                return (CUDAGraphMode.FULL, fe_descriptor, False, None, fe_stats)
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
         num_tokens_padded = batch_descriptor.num_tokens
@@ -4253,6 +4478,18 @@ class NPUModelRunner(GPUModelRunner):
             # The current dummy run only covers LM execution, so we can skip it.
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
+
+        # Full-extend capture: synthetic non-uniform batch (context_cap-sized
+        # prefill requests + zero-query sentinel slots). Only the dedicated
+        # _capture_full_extend_graphs driver sets _fe_capture_desc, so warmup /
+        # profile / upstream dispatcher-key captures keep the normal path.
+        if (
+            self._fe_capture_desc is not None
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not uniform_decode
+        ):
+            assert is_graph_capturing and not is_profile
+            return self._dummy_run_full_extend(self._fe_capture_desc)
 
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -6870,6 +7107,70 @@ class NPUModelRunner(GPUModelRunner):
             and (enable_sp(self.vllm_config) or pass_sp)
         )
 
+    # Full-extend planner; None until _maybe_init_full_extend_planner runs and
+    # every gate passes. See vllm_ascend/worker/v1/full_extend.py.
+    _full_extend_planner: FullExtendPlanner | None = None
+
+    # Full-extend descriptor currently being captured by
+    # _capture_full_extend_graphs. Gates the full-extend branch in _dummy_run
+    # so upstream dispatcher-key captures (mixed FULL keys) keep the regular
+    # dummy path untouched.
+    _fe_capture_desc: BatchDescriptor | None = None
+
+    # Full-extend descriptor chosen by the latest _determine_batch_execution_
+    # and_padding call (identity-compared downstream). Distinguishes a
+    # full-extend replay from upstream mixed-FULL dispatches that fall
+    # through when a full-extend gate rejects the batch.
+    _fe_replay_desc: BatchDescriptor | None = None
+
+    def _is_gqa_only_attention(
+        self,
+        attention_backends: list[set[type[AttentionBackend]]],
+    ) -> bool:
+        """Whether every attention builder is the attention_v1 (GQA/FIA) one.
+
+        full-extend v1 only supports the GQA/FIA path: its capture and
+        per-replay rebinding (FIAParamProvider over ``actual_seq_lengths_q`` /
+        ``seq_lens_list`` / ``block_table``) hang off attention_v1.
+        """
+        for attn_backend_set in attention_backends:
+            for attn_backend in attn_backend_set:
+                builder_cls = attn_backend.get_builder_cls()
+                if builder_cls.__name__ != "AscendAttentionMetadataBuilder":
+                    return False
+        return True
+
+    def _maybe_init_full_extend_planner(
+        self,
+        attention_backends: list[set[type[AttentionBackend]]],
+    ) -> None:
+        """Create the full-extend planner when configuration allows it.
+
+        Kept separate from :meth:`_check_and_update_cudagraph_mode` so the
+        gating reasons stay readable. The planner stays ``None`` (and the
+        whole feature inert) unless every gate passes.
+        """
+        self._full_extend_planner = None
+        fe_cfg = self.ascend_config.full_extend_config
+        if not fe_cfg.enabled:
+            return
+        if enable_sp(self.vllm_config):
+            logger.warning_once("full_extend is disabled: sequence parallelism is not supported yet.")
+            return
+        if not self.compilation_config.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
+            logger.warning_once(
+                "full_extend is disabled: cudagraph_mode=%s has no FULL mode.",
+                self.compilation_config.cudagraph_mode,
+            )
+            return
+        if self.model_config.use_mla or not self._is_gqa_only_attention(attention_backends):
+            logger.warning_once(
+                "full_extend is disabled: only the attention_v1 (GQA/FIA) backend "
+                "is supported in v1; MLA/SFA/DSA backends stay on the regular path."
+            )
+            return
+        self._full_extend_planner = FullExtendPlanner.maybe_create(self.vllm_config, fe_cfg)
+
     def _check_and_update_cudagraph_mode(
         self,
         attention_backends: list[set[type[AttentionBackend]]],
@@ -6929,12 +7230,57 @@ class NPUModelRunner(GPUModelRunner):
             for desc in descs
         })
 
+        # full-extend keeps its own key table (fixed request slots, non-uniform
+        # batches) outside the dispatcher; created here once attention support
+        # is known. Its buckets join GraphParams so MLA-style manual update
+        # paths have entries if they ever adopt full-extend.
+        self._maybe_init_full_extend_planner(attention_backends)
+        if self._full_extend_planner is not None:
+            capture_sizes = sorted(set(capture_sizes) | set(self._full_extend_planner.capture_sizes))
+
         # NOTE: Since aclgraph_batch_sizes cannot be determined until here,
         # we set the graph params right before initializing the keys.
         if self.use_aclgraph:
             set_graph_params(capture_sizes)
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
+
+    def _capture_full_extend_graphs(self) -> None:
+        """Capture the full-extend (non-uniform prefill) graph family.
+
+        Runs after the upstream dispatcher-key capture so its mixed/uniform
+        graphs land first; each full-extend bucket is captured with zero
+        warmup passes (the capture pass itself executes every op once, and
+        large-bucket warmups through the decode-oriented dummy path are both
+        slow and meaningless for the full-extend layout). ``_fe_capture_desc``
+        routes the inherited ``_warmup_and_capture`` into
+        ``_dummy_run_full_extend``.
+        """
+        planner = self._full_extend_planner
+        assert planner is not None
+        logger.info(
+            "full_extend: capturing %d graphs (req_slots=%d)...",
+            len(planner.capture_sizes),
+            planner.req_slots,
+        )
+        parent_module_name = _get_gpu_model_runner_module_name(self)
+        self._engram_capture_active = True
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+                for fe_desc in planner.capture_descriptors():
+                    self._fe_capture_desc = fe_desc
+                    try:
+                        self._warmup_and_capture(
+                            fe_desc, CUDAGraphMode.FULL, num_warmups=0
+                        )
+                    finally:
+                        self._fe_capture_desc = None
+                    torch.npu.synchronize()
+        finally:
+            set_cudagraph_capturing_enabled(False)
+            self._engram_capture_active = False
+        logger.info("full_extend: capture finished.")
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
@@ -6945,6 +7291,9 @@ class NPUModelRunner(GPUModelRunner):
                 cuda_graph_size = GPUModelRunner.capture_model(self)
         finally:
             self._engram_capture_active = False
+
+        if self._full_extend_planner is not None:
+            self._capture_full_extend_graphs()
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and self.update_stream is not None:

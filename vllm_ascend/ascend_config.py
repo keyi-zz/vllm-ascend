@@ -637,6 +637,7 @@ class AscendConfig:
     # ---- sub-configs declared later in this module ----
     # Lambdas defer class lookup until construction, after module initialization.
     xlite_graph_config: XliteGraphConfig = dataclasses.field(default_factory=lambda: XliteGraphConfig())
+    full_extend_config: FullExtendConfig = dataclasses.field(default_factory=lambda: FullExtendConfig())
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
@@ -1409,6 +1410,45 @@ class FinegrainedTPConfig:
                 raise AssertionError("finegrained tp sizes must divide by data_parallel_size.")
         if any(size > 1 for size in module_tp_sizes) and enabled_configs:
             logger.info("finegrained_tp_config enabled: %s", ", ".join(enabled_configs))
+
+
+@config
+class FullExtendConfig:
+    """Configuration Object for ``additional_config["full_extend_config"]``.
+
+    Full-extend captures one whole-forward ACL graph per prefill token bucket
+    for non-uniform (prefill / mixed) batches, with a fixed request-slot axis
+    (zero-query-length sentinel requests) and per-replay attention-parameter
+    rebinding through the UpdatableGraph task-update channel. See
+    ``vllm_ascend/worker/v1/full_extend.py`` for the planning logic.
+    """
+
+    enabled: bool = False
+    #: Max total tokens captured per graph. None -> min(chunked_prefill_size, 8192)
+    max_capture_tokens: int | None = None
+    #: Fixed request slots per graph. None -> max(chunked_prefill_size // 512, 1)
+    req_slots: int | None = None
+    #: Replay gate: padded > raw * padding_factor falls back to PIECEWISE/eager
+    padding_factor: float = 2.0
+    #: Max per-request KV length (incl. prefix) allowed in a full-extend graph.
+    #: None -> max_model_len. Also caps the synthetic query length at capture.
+    max_context_size: int | None = None
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.padding_factor < 1.0:
+            raise ValueError(f"full_extend_config.padding_factor must be >= 1.0, got {self.padding_factor}")
+        if self.req_slots is not None and self.req_slots < 1:
+            raise ValueError(f"full_extend_config.req_slots must be >= 1, got {self.req_slots}")
+        if self.max_capture_tokens is not None and self.max_capture_tokens < 4:
+            raise ValueError(
+                f"full_extend_config.max_capture_tokens must be >= 4, got {self.max_capture_tokens}"
+            )
+        if self.max_context_size is not None and self.max_context_size < 1:
+            raise ValueError(
+                f"full_extend_config.max_context_size must be >= 1, got {self.max_context_size}"
+            )
+        return self
 
 
 @config
