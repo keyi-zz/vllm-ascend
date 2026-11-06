@@ -218,7 +218,11 @@ class FullExtendPlanner:
             )
             return None
 
-        chunked_prefill_size = scheduler_config.chunked_prefill_size
+        # vllm >= 0.33 dropped SchedulerConfig.chunked_prefill_size in favor
+        # of enable_chunked_prefill (chunks at max_num_batched_tokens).
+        chunked_prefill_size = getattr(scheduler_config, "chunked_prefill_size", None)
+        if chunked_prefill_size is None and scheduler_config.enable_chunked_prefill:
+            chunked_prefill_size = scheduler_config.max_num_batched_tokens
         max_num_seqs = scheduler_config.max_num_seqs
         max_model_len = model_config.max_model_len
 
