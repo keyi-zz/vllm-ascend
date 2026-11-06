@@ -199,8 +199,14 @@ class FullExtendPlanner:
             reasons.append("context parallelism")
         if model_config.is_encoder_decoder:
             reasons.append("encoder-decoder model")
-        if getattr(model_config, "multimodal_config", None) is not None:
-            reasons.append("multimodal model")
+        if (
+            getattr(model_config, "multimodal_config", None) is not None
+            and not full_extend_config.allow_multimodal
+        ):
+            reasons.append(
+                "multimodal model (set full_extend_config.allow_multimodal=true "
+                "for text-only traffic)"
+            )
         if vllm_config.lora_config is not None:
             reasons.append("LoRA")
         if getattr(model_config, "is_hybrid", False):

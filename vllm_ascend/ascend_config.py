@@ -1433,6 +1433,10 @@ class FullExtendConfig:
     #: Max per-request KV length (incl. prefix) allowed in a full-extend graph.
     #: None -> max_model_len. Also caps the synthetic query length at capture.
     max_context_size: int | None = None
+    #: Opt-in for multimodal-registered models. Full-extend graphs only cover
+    #: the language-model forward; safe for text-only traffic (the vision
+    #: tower never runs), so VL models may be enabled explicitly.
+    allow_multimodal: bool = False
 
     @model_validator(mode="after")
     def _validate(self):
