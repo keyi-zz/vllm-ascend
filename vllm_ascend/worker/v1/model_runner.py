@@ -1210,9 +1210,9 @@ class NPUModelRunner(GPUModelRunner):
             self.attn_state = AscendAttentionState.ChunkedPrefill
             # Active slots carry the worst-case KV length the graph must
             # tolerate; sentinel slots carry KV length 1 at block 0.
-            self.optimistic_seq_lens_cpu.np[:num_active] = planner.context_cap
-            self.optimistic_seq_lens_cpu.np[num_active:req_slots] = 1
-            self.optimistic_seq_lens_cpu.np[req_slots:].fill(0)
+            self.optimistic_seq_lens_cpu[:num_active] = planner.context_cap
+            self.optimistic_seq_lens_cpu[num_active:req_slots] = 1
+            self.optimistic_seq_lens_cpu[req_slots:].fill_(0)
             self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
             # Zero-length sentinels keep the cumsum flat at num_tokens, so no
