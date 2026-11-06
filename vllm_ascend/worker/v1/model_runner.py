@@ -3912,6 +3912,14 @@ class NPUModelRunner(GPUModelRunner):
                 max_query_len=max_num_scheduled_tokens,
                 max_kv_len=max_kv_len,
             )
+            logger.info(
+                "FE dispatch probe: tokens=%d reqs=%d max_q=%d max_kv=%d -> %s",
+                num_tokens_padded,
+                num_reqs,
+                max_num_scheduled_tokens,
+                max_kv_len,
+                fe_descriptor.num_tokens if fe_descriptor is not None else "fallback",
+            )
             if fe_descriptor is not None:
                 self._fe_replay_desc = fe_descriptor
                 fe_stats = None
