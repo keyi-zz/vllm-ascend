@@ -7157,6 +7157,13 @@ class NPUModelRunner(GPUModelRunner):
         """
         self._full_extend_planner = None
         fe_cfg = self.ascend_config.full_extend_config
+        logger.info(
+            "full_extend gate probe: enabled=%s cudagraph_mode=%s use_mla=%s gqa_only=%s",
+            fe_cfg.enabled,
+            self.compilation_config.cudagraph_mode,
+            self.model_config.use_mla,
+            self._is_gqa_only_attention(attention_backends),
+        )
         if not fe_cfg.enabled:
             return
         if enable_sp(self.vllm_config):
