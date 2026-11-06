@@ -1260,7 +1260,12 @@ class NPUModelRunner(GPUModelRunner):
         else:
             input_ids = self.input_ids.gpu[:num_tokens]
             inputs_embeds = None
-        positions = self.positions[:num_tokens]
+        # M-RoPE models (e.g. VL language towers) must bind the same static
+        # mrope buffer the replay path fills, mirroring _dummy_run.
+        if self.uses_mrope:
+            positions = self.mrope_positions.gpu[:, :num_tokens]
+        else:
+            positions = self.positions[:num_tokens]
         update_cos_sin(positions)
 
         # Logits stay outside the ACL graph (same contract as the existing
