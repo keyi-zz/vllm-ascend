@@ -195,7 +195,7 @@ class FullExtendPlanner:
             reasons.append("pipeline parallelism")
         if parallel_config.data_parallel_size > 1:
             reasons.append("data parallelism (uncoordinated dispatch)")
-        if parallel_config.context_parallel_size > 1:
+        if getattr(parallel_config, "context_parallel_size", 1) > 1:
             reasons.append("context parallelism")
         if model_config.is_encoder_decoder:
             reasons.append("encoder-decoder model")
