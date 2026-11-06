@@ -7313,7 +7313,10 @@ class NPUModelRunner(GPUModelRunner):
             self._engram_capture_active = False
 
         if self._full_extend_planner is not None:
-            self._capture_full_extend_graphs()
+            if os.environ.get("FE_NO_CAPTURE") == "1":
+                logger.info("full_extend: FE_NO_CAPTURE=1, skipping capture (bisect).")
+            else:
+                self._capture_full_extend_graphs()
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and self.update_stream is not None:
