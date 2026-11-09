@@ -1159,16 +1159,29 @@ class NPUModelRunner(GPUModelRunner):
     ) -> int:
         """Fill ``query_start_loc`` for a full-extend replay.
 
-        Real request entries are already populated by ``_prepare_inputs``.
-        Here the token padding is folded into the last real request (its
-        garbage tail rows are trimmed downstream, same as decode FULL) and
-        every sentinel slot ``[num_reqs, req_slots)`` is pinned at
-        ``num_tokens_padded``: zero query length, last entry satisfies the
-        FIA TND constraint. Sentinel KV lengths (1) and zero block-table
-        rows are filled by ``AscendAttentionMetadataBuilder.build`` padding.
+        Real request entries are already populated by ``_prepare_inputs``;
+        ``query_start_loc[num_reqs]`` still holds the raw token total. The
+        token padding becomes its own dummy request in the first sentinel
+        slot — mirroring ``_pad_query_start_loc_for_fia`` — instead of being
+        folded into the last real request: folding leaves that request with
+        q_len > kv_len, and FIA computes the causal window right-aligned on
+        the kv sequence, so every query row of the request reads garbage.
+        The dummy request owns rows ``[raw_total, num_tokens_padded)`` with
+        KV length 1 at block 0 (metadata-build padding); its output rows are
+        trimmed downstream and it never writes KV (slot_mapping padding rows
+        are -1). Remaining sentinel slots stay zero-query, pinned at
+        ``num_tokens_padded``: last entry satisfies the FIA TND constraint.
         """
         assert num_reqs <= req_slots
-        query_start_loc.np[num_reqs] = num_tokens_padded
+        raw_num_tokens = int(query_start_loc.np[num_reqs])
+        assert raw_num_tokens <= num_tokens_padded
+        if raw_num_tokens < num_tokens_padded:
+            # Padding needs the first sentinel slot as a dummy request;
+            # try_dispatch rejects fully-slotted batches before replay.
+            assert num_reqs < req_slots, (
+                "full-extend replay with token padding requires a free "
+                "sentinel slot to hold the padding dummy request"
+            )
         query_start_loc.np[num_reqs + 1 : req_slots + 1] = num_tokens_padded
         query_start_loc.copy_to_gpu()
         return req_slots
@@ -2778,10 +2791,12 @@ class NPUModelRunner(GPUModelRunner):
                     and cudagraph_mode == CUDAGraphMode.FULL
                     and batch_desc is self._fe_replay_desc
                 ):
-                    # Full-extend replay: fold token padding into the last real
-                    # request and fill the sentinel slots (zero query length,
-                    # last entry pinned at num_tokens_padded for the FIA TND
-                    # constraint).
+                    # Full-extend replay: token padding lands in the first
+                    # sentinel slot as a dummy request (folding it into the
+                    # last real request would break FIA's causal window via
+                    # q_len > kv_len); remaining sentinel slots stay
+                    # zero-query, last entry pinned at num_tokens_padded for
+                    # the FIA TND constraint.
                     num_reqs_padded = self._pad_query_start_loc_for_full_extend(
                         self.query_start_loc,
                         num_tokens_padded,

@@ -168,6 +168,34 @@ class TestDispatch:
             is None
         )
 
+    def test_reject_padding_when_slots_full(self):
+        # Padding must land in a sentinel slot as a dummy request; a
+        # fully-slotted batch has no sentinel, so 33 -> 48 must fall back.
+        planner = make_planner(req_slots=4)
+        assert (
+            planner.try_dispatch(num_tokens=33, num_reqs=4, max_query_len=16, max_kv_len=16)
+            is None
+        )
+
+    def test_exact_hit_allowed_when_slots_full(self):
+        planner = make_planner(req_slots=4)
+        desc = planner.try_dispatch(
+            num_tokens=48, num_reqs=4, max_query_len=16, max_kv_len=16
+        )
+        assert desc is not None
+        assert desc.num_tokens == 48
+
+    def test_padding_absorbed_by_sentinel(self):
+        # Regression guard for the q_len > kv_len corruption bug: solo
+        # 11-token step replays at bucket 12 with the padding row owned by
+        # a sentinel dummy request, not by the real request.
+        planner = make_planner(req_slots=4)
+        desc = planner.try_dispatch(
+            num_tokens=11, num_reqs=1, max_query_len=11, max_kv_len=11
+        )
+        assert desc is not None
+        assert desc.num_tokens == 12
+
 
 class TestPadToBucket:
     def test_lookup(self):

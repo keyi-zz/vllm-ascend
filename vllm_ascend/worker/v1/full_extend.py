@@ -165,6 +165,12 @@ class FullExtendPlanner:
         # Padding waste gate: padding rows are real GEMM work.
         if padded > num_tokens * self.padding_factor:
             return None
+        # Token padding must land in a sentinel slot as a dummy request;
+        # a fully-slotted batch has none, so only exact bucket hits may
+        # replay (folding padding into a real request would leave it with
+        # q_len > kv_len and corrupt its attention output).
+        if padded > num_tokens and num_reqs == self.req_slots:
+            return None
         return BatchDescriptor(
             num_tokens=padded, num_reqs=self.req_slots, uniform=False, has_lora=False
         )
